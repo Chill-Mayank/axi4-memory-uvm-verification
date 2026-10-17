@@ -1,0 +1,11 @@
+xcelium.d/
+cov_work/
+waves.shm/
+.simvision/
+logs/
+*.log
+xrun.history
+xrun.key
+obj_smoke/
+.DS_Store
+._*
