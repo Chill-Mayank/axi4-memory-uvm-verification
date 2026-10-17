@@ -1,168 +1,238 @@
-# AXI4 Memory Slave — RTL Design and UVM Verification
+# AXI4 Memory Slave — My First RTL + UVM Verification Project
 
-![SystemVerilog](https://img.shields.io/badge/SystemVerilog-IEEE%201800-blue)
+![SystemVerilog](https://img.shields.io/badge/SystemVerilog-learning-blue)
 ![UVM](https://img.shields.io/badge/UVM-1.1d-green)
 ![Simulator](https://img.shields.io/badge/Simulator-Cadence%20Xcelium%2020.09-red)
-![Status](https://img.shields.io/badge/tests-passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
 
-**Author:** Mayank Ratnakar — M.Tech, Microelectronics and VLSI, IIT Bhilai
+**Mayank Ratnakar** — M.Tech, Microelectronics and VLSI, IIT Bhilai
 
-A synthesizable AXI4 memory slave in SystemVerilog plus a full verification
-environment: a UVM testbench with constrained-random stimulus, a scoreboard
-with a reference model, functional coverage, and an SVA protocol checker.
+I am new to Verilog, SystemVerilog and verification. I built this project to
+learn **how a real bus protocol (AXI4) works** and **how chips are verified in
+industry (UVM)**. It started from a 5-line AND-gate testbench and grew step by
+step into a memory with a full UVM testbench.
 
-Built on the idea of the Iowa State thesis *"Design and Verification of AXI
-Memory Interface"*. Compared with that work, this version adds:
+> **Honest note:** I built this while learning, with step-by-step guidance from
+> an AI assistant (Claude). The practice files in [`learning/`](learning/) are
+> the ones I typed, ran and debugged myself while learning the basics. The final
+> RTL and UVM environment were written with the assistant's help; I ran them on
+> the Cadence Xcelium server in my lab, read the logs, looked at the waveforms
+> in SimVision, and I am still studying every part of the code.
 
-| Feature                       | Reference thesis       | This project |
-|-------------------------------|------------------------|--------------|
-| Burst types                   | INCR only              | FIXED, INCR, WRAP |
-| Burst length                  | up to 16               | 1–256 beats |
-| Narrow / unaligned transfers  | no                     | yes |
-| Write strobes (WSTRB)         | no                     | per-byte |
-| Transaction IDs (BID/RID)     | no                     | yes |
-| Error responses               | no                     | SLVERR for unsupported requests |
-| Read and write at same time   | —                      | independent paths |
-| Protocol assertions (SVA)     | no                     | 15 assertions + 8 cover properties |
-| Functional coverage           | basic                  | covergroup with crosses |
-| Back-pressure testing         | no                     | random READY / VALID gaps |
-| Bug-injection check of the TB | no                     | yes (see below) |
+**New to this? Start here:**
+[AXI basics](docs/AXI_BASICS.md) →
+[Glossary](docs/GLOSSARY.md) →
+[Which file to read first](docs/READING_GUIDE.md) →
+[My learning path](learning/)
 
-## Folder layout
+The idea comes from the Iowa State thesis *"Design and Verification of AXI
+Memory Interface"*, extended with more AXI features.
 
-```
-rtl/axi_mem.sv          DUT: the AXI4 memory slave (synthesizable)
-tb/tb_smoke.sv          quick self-checking testbench without UVM
-tb/axi_params_pkg.sv    bus sizes + reference AXI address math
-tb/axi_if.sv            interface (wires + monitor clocking block)
-tb/axi_pkg.sv           UVM: transaction, driver, monitor, agent,
-                        scoreboard, coverage, env, sequences, tests
-tb/axi_sva.sv           SVA protocol checker, attached with 'bind'
-tb/tb_top.sv            UVM top: clock, reset, DUT, run_test()
-docs/                   waveform screenshots
-sim/files.f             compile list for xrun
-sim/run_smoke.sh        run the non-UVM test
-sim/run_uvm.sh          run one UVM test
-sim/regress.sh          all tests x several seeds, pass/fail table
-```
+---
 
-## How to run (lab server, Cadence Xcelium)
+## AXI in 30 seconds (the courier analogy)
 
-```
-csh
-source /home/install/Cadence_cshrc.txt
-setenv PATH /home/install/XCELIUM2009/tools.lnx86/bin:${PATH}
-cd axi4_mem_project/sim
+AXI is a set of rules for a **processor** (the master) to read and write a
+**memory** (the slave). Think of it as a courier service with 5 separate lanes:
 
-./run_smoke.sh                         # quick test, prints TEST PASSED
-./run_uvm.sh                           # main UVM test (axi_rand_test)
-./run_uvm.sh axi_directed_test         # only the corner cases
-./run_uvm.sh axi_backpressure_test     # slow master, lots of stalls
-./run_uvm.sh axi_rand_test 1234 gui    # fixed seed + SimVision waveforms
-./regress.sh                           # 3 tests x 5 seeds
-imc -gui &                             # coverage viewer: load cov_work/scope/<test>
-```
+| Lane | Name           | Who sends | Courier analogy |
+|------|----------------|-----------|-----------------|
+| AW   | Write Address  | processor | "Deliver to house number 0x10" |
+| W    | Write Data     | processor | the parcels (one per beat) |
+| B    | Write Response | memory    | the delivery receipt |
+| AR   | Read Address   | processor | "Bring me what is in house 0x10" |
+| R    | Read Data      | memory    | the parcels coming back |
 
-A run passes when the log shows `*** TEST PASSED ***`, `UVM_ERROR :    0`
-and no assertion failures.
+Every lane uses the same **VALID / READY handshake**: the sender raises VALID
+("I have something"), the receiver raises READY ("I can take it"). Data moves
+only on a clock edge where **both** are 1. A **burst** is several parcels for
+one address label; the last parcel is marked with LAST.
 
-## The DUT in one picture
+More detail, in simple words: [`docs/AXI_BASICS.md`](docs/AXI_BASICS.md).
 
-```
-           AW ──► [ write FSM: IDLE → DATA → RESP ] ──► B
-            W ──►        │ byte writes (WSTRB)
-                         ▼
-                    mem[0 .. 2^ADDR_W-1]   (bytes)
-                         ▲
-           AR ──► [ read FSM:  IDLE → DATA ] ──► R
+---
+
+## What the design supports
+
+* All five AXI4 channels, reads and writes at the same time
+* Burst types FIXED, INCR and WRAP, 1 to 256 beats
+* Narrow transfers (1, 2 or 4 bytes per beat) and unaligned addresses
+* Write strobes (WSTRB): write only some bytes of a word
+* Transaction IDs (the answer carries the same ID as the question)
+* Error response SLVERR for requests the memory cannot do
+
+### The two state machines inside the memory
+
+Write side — one address, many data beats, then one response:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> W_IDLE
+    W_IDLE --> W_DATA : AW handshake (address accepted)
+    W_DATA --> W_DATA : W beat (not last)
+    W_DATA --> W_RESP : W beat with WLAST
+    W_RESP --> W_IDLE : B handshake (response taken)
 ```
 
-* Parameters: `DATA_W` (default 32), `ADDR_W` (8 → 256-byte memory), `ID_W` (4).
-* One outstanding burst per direction; reads and writes run in parallel.
-* SLVERR when: burst type is reserved (2'b11), AxSIZE is wider than the bus,
-  WRAP length is not 2/4/8/16 beats, or WRAP start is not size-aligned.
-  A write with SLVERR changes nothing; a read with SLVERR returns zeros.
-* Lint clean (Verilator `-Wall`); synthesizes with Yosys with no latches.
+Read side — one address, then data beats until RLAST:
 
-## The testbench in one picture
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> R_IDLE
+    R_IDLE --> R_DATA : AR handshake (address accepted)
+    R_DATA --> R_DATA : R beat (not last)
+    R_DATA --> R_IDLE : R beat with RLAST
+```
+
+Compared with the reference thesis (INCR bursts only), this adds FIXED/WRAP
+bursts, strobes, IDs, error responses, assertions and functional coverage.
+
+---
+
+## How the testbench checks the design
 
 ```
- test ─► env ─┬─ agent ─┬─ sequencer ─► driver ──► axi_if ──► DUT ◄── axi_sva (bind)
+ test ─► env ─┬─ agent ─┬─ sequencer ─► driver ──► axi_if ──► DUT ◄── axi_sva (assertions)
               │         └─ monitor ◄────────────── axi_if
-              ├─ scoreboard  (reference memory, checks data/ID/resp/RLAST/beat count)
-              └─ coverage    (burst x size x direction, burst x length, responses)
+              ├─ scoreboard  (keeps its own copy of memory, compares every byte)
+              └─ coverage    (records which kinds of bursts were tested)
 ```
 
-* **Driver** drives on the falling clock edge, so the DUT never sees a
-  changing signal on its rising edge (no races in any simulator).
-  Knobs `bready_pct`, `rready_pct`, `wgap_pct` control back-pressure.
-* **Monitor** only watches the wires (clocking block, `#1step` sampling)
-  and rebuilds whole bursts.
-* **Scoreboard** keeps a byte array of what memory should hold and checks
-  every byte the DUT returns, plus BRESP/RRESP, BID/RID, RLAST position and
-  the number of beats.
-* **Reference model** computes burst addresses beat by beat straight from
-  the spec, independently of the RTL, so the same mistake cannot hide in both.
+| Part        | Job (in one line) | Analogy |
+|-------------|-------------------|---------|
+| sequence    | decides *what* to send (random or hand-picked bursts) | the exam paper |
+| driver      | wiggles the AXI wires to send it | the student writing answers |
+| monitor     | only watches the wires and writes down what happened | the CCTV camera |
+| scoreboard  | compares memory's answers with its own expected copy | the examiner with the answer key |
+| coverage    | counts which kinds of questions were asked | the syllabus checklist |
+| assertions  | rules checked on every clock (e.g. VALID must not drop before READY) | the traffic police |
 
-### Tests
+---
 
-| Test                    | What it does |
-|-------------------------|--------------|
-| `axi_directed_test`     | 24 hand-picked corner cases: WRAP from mid-window, 16-beat WRAP, 256-beat byte burst, narrow + unaligned, FIXED, partial strobes, every SLVERR case |
-| `axi_rand_test`         | directed + 300 random write/read-back pairs + 300 random mixed transactions (~5 % illegal) |
-| `axi_backpressure_test` | same as rand, but READY only 20 % of the time and frequent W gaps |
-
-## Results
-
-**Cadence Xcelium 20.09, UVM 1.1d** — `axi_rand_test`, random seed 1267671211:
+## Results (Cadence Xcelium 20.09, UVM 1.1d)
 
 ```
 writes=466 reads=458 slverr=42 bytes_checked=8006 errors=0
-functional coverage = 98.1%
+functional coverage = 98.1%   (97-98% across seeds)
 *** TEST PASSED ***
 UVM_ERROR :    0
 UVM_FATAL :    0
 ```
 
-Waveform of the first directed bursts in SimVision (4-beat INCR write + read,
-then a WRAP write with a W-channel gap and B-channel back-pressure):
+Terminal output at the end of a run on the lab server:
+
+![UVM test passed on Xcelium](docs/xcelium_test_passed.png)
+
+**Regression:** 3 tests × 5 random seeds = 15 runs, all passing
+(`./regress.sh`). Each seed creates a different random mix of bursts:
+
+| Test                    | What it does | Result |
+|-------------------------|--------------|--------|
+| `axi_directed_test`     | 24 hand-picked corner cases (WRAP, 256-beat burst, strobes, every error case) | 5 / 5 PASS |
+| `axi_rand_test`         | ~900 random bursts, each write read back | 5 / 5 PASS |
+| `axi_backpressure_test` | same, but the processor is slow to accept data | 5 / 5 PASS |
+
+![Regression: 15 passed, 0 failed](docs/regression_15_pass.png)
+
+**Coverage in Cadence IMC** (`axi_rand_test`, seed 1). Coverage answers the
+question "which parts of the design did the tests actually exercise?":
+
+| Coverage type | Result | What it means (simply) |
+|---------------|--------|------------------------|
+| FSM           | **100%** (20/20) | every state and every state change of the read and write state machines happened |
+| Expression    | 95.8% (52/54)    | almost every condition (`a && b`) was tried both true and false |
+| Block         | 94.4% (166/172)  | almost every line of RTL ran at least once |
+| Toggle        | 84.0%            | most wires went 0→1 and 1→0 (some upper address/ID bits rarely change) |
+| Covergroup    | **98.6%** (160/168) | almost every kind of burst (type × size × length × direction) was tested |
+| Assertions + covers | 78.3% (36/46) | all assertions passed; a few cover points (rare scenarios) were not hit in this one seed |
+| **Overall**   | **91.6%** | |
+
+![Coverage in IMC](docs/imc_coverage.png)
+
+**Waveform in SimVision** — a 4-beat write (AW → 4 W beats with WLAST → B),
+a 4-beat read (AR → 4 R beats with RLAST), then a WRAP write where the
+testbench pauses in the middle and makes the memory wait before taking the
+response:
 
 ![First bursts in SimVision](docs/waveform_first_bursts.png)
 
-Whole 145 µs run (the long block near the start is the 256-beat burst):
+Whole run (145 µs). The long block near the start is a 256-beat burst:
 
 ![Full run](docs/waveform_full_run.png)
 
-Also checked with Verilator 5 + UVM before moving to Xcelium. Every run:
-`UVM_ERROR : 0`, no assertion failures.
+**Does the testbench really catch bugs?** I broke the design on purpose in 5
+different ways and re-ran the test. Every bug was caught:
 
-| Test                    | Bursts (wr + rd) | SLVERR cases | Bytes compared | Functional coverage |
-|-------------------------|------------------|--------------|----------------|---------------------|
-| `axi_directed_test`     | 12 + 12          | 6            | ~405           | 87.7 %              |
-| `axi_rand_test`         | ~470 + ~450      | ~50          | ~2,700-3,100   | 97-98 %             |
-| `axi_backpressure_test` | ~470 + ~450      | ~50          | ~2,700-3,100   | 97-98 %             |
+| Bug I put in on purpose            | What caught it |
+|------------------------------------|----------------|
+| WRAP burst does not wrap around    | scoreboard (wrong data) |
+| Write strobes ignored              | scoreboard (wrong data) |
+| RLAST missing                      | assertion `a_rlast_position` |
+| Response ID always 0               | assertion `a_bid_match` |
+| Error response never sent          | scoreboard |
 
-Smoke test (non-UVM): 407 writes + 407 reads per run, ~15,000 checks, 0 errors.
+---
 
-**Does the testbench really catch bugs?** Each bug below was planted into the
-RTL on purpose and the UVM test was run again. All five were caught:
+## Folder layout
 
-| Planted bug                              | Caught by |
-|------------------------------------------|-----------|
-| WRAP burst does not wrap                 | scoreboard: 51 data mismatches |
-| WSTRB ignored (all bytes written)        | scoreboard: 1,160 data mismatches |
-| RLAST missing on 4-beat reads            | SVA `a_rlast_position` |
-| BID not returned (always 0)              | SVA `a_bid_match` |
-| SLVERR never returned                    | scoreboard (BRESP + corrupted data) |
+```
+learning/   my step-by-step practice files (AND gate → handshake → single write/read → burst)
+rtl/        axi_mem.sv            the memory design (synthesizable)
+tb/         tb_smoke.sv           simple testbench without UVM
+            axi_params_pkg.sv     bus sizes + expected-address math
+            axi_if.sv             the bundle of AXI wires
+            axi_pkg.sv            UVM classes: driver, monitor, scoreboard, coverage, tests
+            axi_sva.sv            protocol assertions
+            tb_top.sv             top module that connects everything
+sim/        run scripts (Cadence Xcelium, and Verilator for the simple test)
+docs/       AXI basics, glossary, reading guide, screenshots
+```
 
-Found on the way: one simulator silently ignored the `data.size() == len+1`
-constraint, so writes went out with WSTRB = 0 and the test still "passed".
-Fix: arrays are now built in `post_randomize()`, and the scoreboard fails any
-test that compares too few bytes. A hung DUT now ends with a UVM timeout.
+## How to run
 
-## Possible next steps
+**No Cadence? Use the free simulator Verilator** (runs the simple test + assertions):
 
-* Multiple outstanding transactions and out-of-order IDs.
-* AXI4 4 KB boundary check, exclusive access (AxLOCK).
-* A second agent in passive mode for system-level reuse.
-* Formal proof of the SVA properties (Cadence Jasper).
+```
+sudo apt install verilator        # Ubuntu, needs version 5 or newer
+cd sim
+./run_smoke_verilator.sh          # prints TEST PASSED
+```
+
+**With Cadence Xcelium** (full UVM testbench):
+
+```
+cd sim
+./run_smoke.sh                         # simple test, prints TEST PASSED
+./run_uvm.sh                           # main UVM test
+./run_uvm.sh axi_directed_test         # only the hand-picked corner cases
+./run_uvm.sh axi_backpressure_test     # slow processor, lots of waiting
+./run_uvm.sh axi_rand_test 1 gui       # open waveforms in SimVision
+./regress.sh                           # 3 tests x 5 seeds
+```
+
+A run passes when the log shows `*** TEST PASSED ***` and `UVM_ERROR :    0`.
+
+---
+
+## What I learned
+
+* VALID/READY handshake and why VALID must never wait for READY (deadlock)
+* Why one burst has many data beats but only one response
+* How to read a waveform in SimVision and find a handshake
+* Why a testbench must be tested too (one early version said PASS while
+  checking almost nothing; now the scoreboard fails if it compares too little)
+* How the UVM pieces (driver, monitor, scoreboard) split the work
+
+## What I am still learning / next steps
+
+* Reading and explaining every line of the UVM code on my own
+* Writing my own new sequences and assertions without help
+* Multiple outstanding transactions and out-of-order IDs
+* Closing the remaining coverage holes (toggle and cover points) with new tests
+* Formal verification of the assertions (Cadence Jasper)
+
+---
+
+License: MIT
