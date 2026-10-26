@@ -216,6 +216,26 @@ A run passes when the log shows `*** TEST PASSED ***` and `UVM_ERROR :    0`.
 
 ---
 
+### How this differs from the reference thesis
+
+The thesis builds an AXI3 slave that already has FIXED, INCR and WRAP bursts,
+write strobes, IDs and SLVERR/DECERR responses, but it only shows results for
+INCR bursts. This project keeps the same idea and changes how it is built and checked:
+
+* **AXI4 instead of AXI3:** bursts up to 256 beats (thesis: 16), no WID
+* **Strobes and narrow transfers follow the spec:** byte lane *i* always goes to
+  aligned address + *i* (the thesis packs enabled bytes into consecutive addresses)
+* **Synthesizable RTL:** registered `always_ff` state machines
+  (the thesis writes memory and counters inside `always_comb`)
+* **Real UVM testbench:** sequences, back-pressure, a byte-level scoreboard that
+  also checks responses, IDs and RLAST, 15 SVA assertions and functional coverage
+* **Proof the testbench works:** 5 bugs injected on purpose, all 5 caught
+
+**What the thesis has that this project does not:** a DECERR response
+(this memory covers the whole address space) and a full written report.
+
+---
+
 ## What I learned
 
 * VALID/READY handshake and why VALID must never wait for READY (deadlock)
